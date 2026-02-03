@@ -1,0 +1,70 @@
+# dbt Profile Configuration for Windows + DuckDB
+# Copy this file to %USERPROFILE%\.dbt\profiles.yml
+
+wi_prov_medicaid:
+  target: dev
+  
+  outputs:
+    
+    dev:
+      type: duckdb
+      path: 'C:\data\duckdb\wi_prov_medicaid_dev.duckdb'
+      threads: 4
+      # DuckDB-specific extensions
+      extensions:
+        - httpfs     # For reading remote files
+        - parquet    # Parquet file support
+        - json       # JSON support
+        - postgres   # PostgreSQL compatibility
+      # Settings for better performance
+      settings:
+        memory_limit: '4GB'
+        threads: 4
+        max_memory: '4GB'
+    
+    test:
+      type: duckdb
+      path: 'C:\data\duckdb\wi_prov_medicaid_test.duckdb'
+      threads: 2
+      extensions:
+        - httpfs
+        - parquet
+        - json
+      settings:
+        memory_limit: '2GB'
+        threads: 2
+    
+    prod:
+      type: duckdb
+      path: 'C:\data\duckdb\wi_prov_medicaid_prod.duckdb'
+      threads: 8
+      extensions:
+        - httpfs
+        - parquet
+        - json
+        - postgres
+      settings:
+        memory_limit: '8GB'
+        threads: 8
+        max_memory: '8GB'
+
+# Windows Setup Instructions:
+#
+# 1. Install dbt and DuckDB adapter:
+#    pip install dbt-core dbt-duckdb
+#
+# 2. Create directories:
+#    mkdir C:\data\duckdb
+#    mkdir C:\data\wi_medicaid
+#
+# 3. Create .dbt directory in your user folder:
+#    mkdir %USERPROFILE%\.dbt
+#
+# 4. Copy this file:
+#    copy profiles.yml.template %USERPROFILE%\.dbt\profiles.yml
+#
+# 5. Test connection:
+#    dbt debug
+#
+# Note: Paths use forward slashes in YAML, but you can also use:
+#   path: 'C:/data/duckdb/wi_prov_medicaid_dev.duckdb'
