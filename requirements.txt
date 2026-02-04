@@ -1,0 +1,24 @@
+# Wisconsin Provider Medicaid - Python Dependencies
+# Install all requirements: pip install -r requirements.txt
+
+# Core dbt and DuckDB
+dbt-core>=1.7.0
+dbt-duckdb>=1.7.0
+
+# Dagster and integrations
+dagster>=1.6.0
+dagster-webserver>=1.6.0
+dagster-dbt>=0.22.0
+
+# Data manipulation
+pandas>=2.0.0
+duckdb>=0.9.0
+
+# Utilities
+python-dateutil>=2.8.0
+pyyaml>=6.0
+
+# Optional: For advanced features
+# dagster-postgres  # If using Postgres for Dagster storage
+# dagster-slack     # For Slack notifications
+# dagster-pagerduty # For PagerDuty alerts
