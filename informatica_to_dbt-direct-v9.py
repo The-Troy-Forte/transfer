@@ -1,0 +1,1937 @@
+"""
+Informatica PowerCenter + IDMC -> dbt (DuckDB) Converter
+=========================================================
+Full mapping conversion covering all 12 transformation types,
+source->target pair decomposition, SCD detection, expression
+transpilation, lookup SQL inlining, and parameter substitution.
+
+Modes:
+  --xml   Local PowerMart / Taskflow XML files
+  --idmc  Live IDMC REST API (Bearer token)
+  --pc    PowerCenter (SOAP | direct-DB | XML exports)
+
+Install:
+  pip install httpx python-dotenv dbt-duckdb
+  pip install sqlalchemy cx_Oracle          # PC direct-DB Oracle
+  pip install sqlalchemy pyodbc             # PC direct-DB SQL Server
+  pip install requests lxml                 # PC SOAP
+"""
+
+import argparse, json, os, re, sys, time, textwrap
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+import xml.etree.ElementTree as ET
+
+try:
+    from dotenv import load_dotenv; load_dotenv()
+except ImportError:
+    pass
+
+try:
+    import httpx; _HTTP = "httpx"
+except ImportError:
+    import urllib.request; _HTTP = "urllib"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+def _snake(name: str) -> str:
+    s = re.sub(r"[-\s.]+", "_", name)
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s)
+    s = re.sub(r"([a-z\d])([A-Z])", r"\1_\2", s)
+    return s.lower().strip("_")
+
+def collect_files(path: str, exts: tuple) -> list[str]:
+    p = Path(path)
+    if p.is_file() and p.suffix.lower() in exts:
+        return [str(p)]
+    if p.is_dir():
+        return [str(f) for f in sorted(p.rglob("*")) if f.suffix.lower() in exts]
+    return []
+
+# ---------------------------------------------------------------------------
+# IICS namespace / type maps
+# ---------------------------------------------------------------------------
+NS = {
+    "sf":   "http://schemas.active-endpoints.com/appmodules/screenflow/2010/10/avosScreenflow.xsd",
+    "repo": "http://schemas.active-endpoints.com/appmodules/repository/2010/10/avrepository.xsd",
+}
+
+INFA_TYPE_MAP: dict[str, str] = {
+    "string":"varchar","nstring":"varchar","char":"varchar","nchar":"varchar","text":"varchar",
+    "double":"double","decimal":"decimal(38,10)","integer":"integer","smallinteger":"smallint",
+    "bigint":"bigint","real":"float","float":"float",
+    "date/time":"timestamp","date":"date","time":"time","binary":"blob",
+}
+
+# ---------------------------------------------------------------------------
+# Expression Transpiler  — full Informatica -> DuckDB SQL
+# ---------------------------------------------------------------------------
+class ExpressionTranspiler:
+    """
+    Converts Informatica expressions to DuckDB-compatible SQL.
+    Handles: IIF, ISNULL, NVL, NVL2, DECODE, INSTR, SUBSTR, TO_CHAR,
+             TO_DATE, ADD_TO_DATE, DATE_DIFF, GET_DATE_PART, TRUNC,
+             UPPER/LOWER/TRIM/LTRIM/RTRIM, LPAD/RPAD, REPLACE, CONCAT,
+             ABS, CEIL, FLOOR, MOD, ROUND, SUM/AVG/MIN/MAX/COUNT,
+             IS_SPACES, IN, LIKE, BETWEEN, ERROR, ABORT,
+             :SP. stored-procedure prefix stripping,
+             $$PARAM substitution.
+    """
+
+    # Simple 1-to-1 function renames (no arg restructuring needed)
+    _RENAMES: dict[str, str] = {
+        "ISNULL":       "({0} IS NULL)",
+        "IS_SPACES":    "(TRIM({0}) = '')",
+        "NVL":          "COALESCE({0}, {1})",
+        "NVL2":         "CASE WHEN {0} IS NOT NULL THEN {1} ELSE {2} END",
+        "UPPER":        "UPPER({0})",
+        "LOWER":        "LOWER({0})",
+        "LTRIM":        "LTRIM({0})",
+        "RTRIM":        "RTRIM({0})",
+        "TRIM":         "TRIM({0})",
+        "LENGTH":       "LENGTH({0})",
+        "INSTR":        "INSTR({0}, {1})",
+        "SUBSTR":       "SUBSTRING({0}, {1}, {2})",
+        "LPAD":         "LPAD({0}, {1}, {2})",
+        "RPAD":         "RPAD({0}, {1}, {2})",
+        "REPLACE":      "REPLACE({0}, {1}, {2})",
+        "CONCAT":       "CONCAT({0}, {1})",
+        "TO_CHAR":      "CAST({0} AS VARCHAR)",
+        "TO_INTEGER":   "CAST({0} AS INTEGER)",
+        "TO_DECIMAL":   "CAST({0} AS DECIMAL(38,10))",
+        "TO_FLOAT":     "CAST({0} AS FLOAT)",
+        "ABS":          "ABS({0})",
+        "CEIL":         "CEIL({0})",
+        "FLOOR":        "FLOOR({0})",
+        "MOD":          "({0} % {1})",
+        "ROUND":        "ROUND({0}, {1})",
+        "TRUNC":        "TRUNC({0})",
+        "SQRT":         "SQRT({0})",
+        "POWER":        "POWER({0}, {1})",
+        "EXP":          "EXP({0})",
+        "LOG":          "LN({0})",
+        "ADD_TO_DATE":  "({0} + INTERVAL {1} {2})",
+        "LAST_DAY":     "LAST_DAY({0})",
+        "DATE_DIFF":    "DATEDIFF('{2}', {0}, {1})",
+        "GET_DATE_PART":"DATE_PART('{1}', {0})",
+        "SYSDATE":      "CURRENT_TIMESTAMP",
+        "SYSTIMESTAMP": "CURRENT_TIMESTAMP",
+        "SUM":          "SUM({0})",
+        "AVG":          "AVG({0})",
+        "MIN":          "MIN({0})",
+        "MAX":          "MAX({0})",
+        "COUNT":        "COUNT({0})",
+        "FIRST":        "FIRST({0})",
+        "LAST":         "LAST({0})",
+        "MEDIAN":       "MEDIAN({0})",
+        "STDDEV":       "STDDEV({0})",
+        "VARIANCE":     "VARIANCE({0})",
+        "ERROR":        "NULL  /* ERROR({0}) */",
+        "ABORT":        "NULL  /* ABORT({0}) */",
+    }
+
+    def __init__(self, params: Optional[dict] = None):
+        self._params = params or {}   # flat {$$KEY: value}
+
+    def transpile(self, expr: str) -> str:
+        if not expr:
+            return ""
+        out = expr
+        # XML entities
+        out = (out.replace("&apos;", "'").replace("&amp;", "&")
+                  .replace("&#xD;&#xA;", "\n").replace("&#xA;", "\n"))
+        # Strip SP prefix
+        out = re.sub(r":SP\.", "", out)
+        # Parameter substitution
+        for key, val in self._params.items():
+            out = out.replace(key, f"'{val}'")
+        # Multi-step rewrites
+        out = self._iif_to_case(out)
+        out = self._decode_to_case(out)
+        out = self._to_date(out)
+        out = self._apply_renames(out)
+        return out.strip()
+
+    # ------------------------------------------------------------------
+    def _apply_renames(self, expr: str) -> str:
+        """Apply simple function-rename map using arg-aware extraction."""
+        for infa_fn, tmpl in self._RENAMES.items():
+            pattern = re.compile(rf"\b{infa_fn}\s*\(", re.IGNORECASE)
+            result, i = [], 0
+            while i < len(expr):
+                m = pattern.search(expr, i)
+                if not m:
+                    result.append(expr[i:]); break
+                result.append(expr[i:m.start()])
+                args_str, end = self._extract_args_str(expr, m.end())
+                args = self._split_args(args_str)
+                # Fill template placeholders
+                filled = tmpl
+                for idx, arg in enumerate(args):
+                    filled = filled.replace(f"{{{idx}}}", arg.strip())
+                result.append(filled)
+                i = end
+            expr = "".join(result)
+        return expr
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _iif_to_case(expr: str) -> str:
+        pattern = re.compile(r"\bIIF\s*\(", re.IGNORECASE)
+        result, i = [], 0
+        while i < len(expr):
+            m = pattern.search(expr, i)
+            if not m:
+                result.append(expr[i:]); break
+            result.append(expr[i:m.start()])
+            args_str, end = ExpressionTranspiler._extract_args_str(expr, m.end())
+            args = ExpressionTranspiler._split_args(args_str)
+            if len(args) >= 3:
+                result.append(
+                    f"CASE WHEN {args[0].strip()} THEN {args[1].strip()} "
+                    f"ELSE {args[2].strip()} END"
+                )
+            else:
+                result.append(f"IIF({args_str})")
+            i = end
+        return "".join(result)
+
+    @staticmethod
+    def _decode_to_case(expr: str) -> str:
+        """DECODE(col, v1,r1, v2,r2, ..., default) -> CASE WHEN col=v1 THEN r1 ..."""
+        pattern = re.compile(r"\bDECODE\s*\(", re.IGNORECASE)
+        result, i = [], 0
+        while i < len(expr):
+            m = pattern.search(expr, i)
+            if not m:
+                result.append(expr[i:]); break
+            result.append(expr[i:m.start()])
+            args_str, end = ExpressionTranspiler._extract_args_str(expr, m.end())
+            args = [a.strip() for a in ExpressionTranspiler._split_args(args_str)]
+            if len(args) >= 3:
+                col = args[0]
+                pairs = args[1:]
+                whens = []
+                j = 0
+                while j + 1 < len(pairs):
+                    whens.append(f"WHEN {col} = {pairs[j]} THEN {pairs[j+1]}")
+                    j += 2
+                default = f"ELSE {pairs[j]}" if j < len(pairs) else ""
+                result.append(f"CASE {' '.join(whens)} {default} END")
+            else:
+                result.append(f"DECODE({args_str})")
+            i = end
+        return "".join(result)
+
+    @staticmethod
+    def _to_date(expr: str) -> str:
+        """TO_DATE(str, fmt) -> STRPTIME(str, fmt)"""
+        pattern = re.compile(r"\bTO_DATE\s*\(", re.IGNORECASE)
+        result, i = [], 0
+        while i < len(expr):
+            m = pattern.search(expr, i)
+            if not m:
+                result.append(expr[i:]); break
+            result.append(expr[i:m.start()])
+            args_str, end = ExpressionTranspiler._extract_args_str(expr, m.end())
+            args = ExpressionTranspiler._split_args(args_str)
+            if len(args) == 2:
+                # Convert Oracle/Infa format mask to strptime
+                fmt = args[1].strip().strip("'")
+                fmt = (fmt.replace("YYYY", "%Y").replace("MM", "%m")
+                           .replace("DD", "%d").replace("HH24", "%H")
+                           .replace("HH", "%I").replace("MI", "%M")
+                           .replace("SS", "%S"))
+                result.append(f"STRPTIME({args[0].strip()}, '{fmt}')")
+            else:
+                result.append(f"TO_DATE({args_str})")
+            i = end
+        return "".join(result)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_args_str(expr: str, start: int) -> tuple[str, int]:
+        """Return (content_inside_parens, index_after_closing_paren)."""
+        depth, j, buf = 1, start, []
+        while j < len(expr) and depth > 0:
+            ch = expr[j]
+            if ch == "(": depth += 1
+            elif ch == ")": depth -= 1
+            if depth > 0: buf.append(ch)
+            j += 1
+        return "".join(buf), j
+
+    @staticmethod
+    def _split_args(s: str) -> list[str]:
+        args, depth, buf, in_str = [], 0, [], False
+        prev = ""
+        for ch in s:
+            if ch == "'" and prev != "\\":
+                in_str = not in_str
+            if not in_str:
+                if ch == "(": depth += 1
+                elif ch == ")": depth -= 1
+            if ch == "," and depth == 0 and not in_str:
+                args.append("".join(buf)); buf = []
+            else:
+                buf.append(ch)
+            prev = ch
+        if buf:
+            args.append("".join(buf))
+        return args
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+@dataclass
+class TransformField:
+    name: str
+    datatype: str
+    port_type: str
+    expression: str = ""
+    precision: int = 4000
+    scale: int = 0
+    default_value: str = ""
+    description: str = ""
+    group_name: str = ""     # Router / Union group
+
+    @property
+    def duckdb_type(self) -> str:
+        return INFA_TYPE_MAP.get(self.datatype.lower(), "varchar")
+
+    @property
+    def is_input(self) -> bool:
+        return "INPUT" in self.port_type and "OUTPUT" not in self.port_type
+
+    @property
+    def is_output(self) -> bool:
+        return "OUTPUT" in self.port_type
+
+    @property
+    def is_local(self) -> bool:
+        return "LOCAL VARIABLE" in self.port_type
+
+
+@dataclass
+class Connector:
+    from_instance: str
+    from_field: str
+    to_instance: str
+    to_field: str
+
+
+@dataclass
+class Transformation:
+    name: str
+    ttype: str
+    fields: list[TransformField] = field(default_factory=list)
+    attributes: dict[str, str] = field(default_factory=dict)
+    groups: dict[str, list[TransformField]] = field(default_factory=dict)  # Router groups
+    description: str = ""
+    reusable: bool = False
+
+    @property
+    def inputs(self): return [f for f in self.fields if f.is_input]
+    @property
+    def outputs(self): return [f for f in self.fields if f.is_output]
+    @property
+    def locals(self): return [f for f in self.fields if f.is_local]
+    @property
+    def lookup_table(self): return self.attributes.get("Lookup table name", "")
+    @property
+    def lookup_sql(self): return self.attributes.get("Lookup Sql Override", "")
+    @property
+    def lookup_condition(self): return self.attributes.get("Lookup condition", "")
+    @property
+    def filter_condition(self): return self.attributes.get("Filter Condition", "")
+    @property
+    def update_strategy(self): return self.attributes.get("Update Strategy Expression", "DD_INSERT")
+    @property
+    def sp_name(self): return self.attributes.get("Stored Procedure Name", self.name)
+    @property
+    def seq_start(self): return int(self.attributes.get("Start Value", "1"))
+    @property
+    def seq_increment(self): return int(self.attributes.get("Increment By", "1"))
+    @property
+    def rank_by(self): return self.attributes.get("Rank By", "")
+    @property
+    def rank_count(self): return self.attributes.get("Top/Bottom", "10")
+    @property
+    def normalizer_occur(self): return int(self.attributes.get("Number Of Occurrences", "1"))
+
+
+@dataclass
+class MappingInstance:
+    name: str
+    transformation_name: str
+    transformation_type: str
+    reusable: bool = False
+
+
+@dataclass
+class SourceTargetPair:
+    """Represents one source -> target data flow path in a mapping."""
+    mapping_name: str
+    folder: str
+    source_instance: str
+    source_table: str
+    target_instance: str
+    target_table: str
+    transformations: list[str]        # ordered instance names between src and tgt
+    is_scd2: bool = False
+    scd_key_cols: list[str] = field(default_factory=list)
+    scd_hist_cols: list[str] = field(default_factory=list)
+    update_strategy: str = "DD_INSERT"
+
+
+@dataclass
+class Mapping:
+    name: str
+    folder: str
+    description: str = ""
+    transformations: dict[str, Transformation] = field(default_factory=dict)
+    instances: dict[str, MappingInstance] = field(default_factory=dict)
+    connectors: list[Connector] = field(default_factory=list)
+    is_mapplet: bool = False
+    source_target_pairs: list[SourceTargetPair] = field(default_factory=list)
+
+    def topo_sort(self) -> list[str]:
+        deps: dict[str, set] = {n: set() for n in self.instances}
+        for c in self.connectors:
+            if c.to_instance in deps:
+                deps[c.to_instance].add(c.from_instance)
+        ordered, visited = [], set()
+        def visit(n):
+            if n in visited: return
+            visited.add(n)
+            for d in deps.get(n, []): visit(d)
+            ordered.append(n)
+        for n in list(self.instances): visit(n)
+        return ordered
+
+    def detect_source_target_pairs(self):
+        """Walk DAG to enumerate distinct source->target paths."""
+        sources = [n for n, inst in self.instances.items()
+                   if self.transformations.get(inst.transformation_name)
+                   and self.transformations[inst.transformation_name].ttype
+                   in ("Input Transformation","Source Qualifier","Source Definition")]
+        targets = [n for n, inst in self.instances.items()
+                   if self.transformations.get(inst.transformation_name)
+                   and self.transformations[inst.transformation_name].ttype
+                   in ("Output Transformation","Target Definition")]
+
+        # Build forward adjacency
+        fwd: dict[str, set[str]] = {n: set() for n in self.instances}
+        for c in self.connectors:
+            fwd.setdefault(c.from_instance, set()).add(c.to_instance)
+
+        for src in sources:
+            # BFS from each source to find reachable targets
+            visited_path: dict[str, list[str]] = {src: [src]}
+            queue = [src]
+            while queue:
+                cur = queue.pop(0)
+                for nxt in fwd.get(cur, []):
+                    if nxt not in visited_path:
+                        visited_path[nxt] = visited_path[cur] + [nxt]
+                        queue.append(nxt)
+            for tgt in targets:
+                if tgt in visited_path:
+                    path = visited_path[tgt]
+                    src_inst = self.instances.get(src)
+                    tgt_inst = self.instances.get(tgt)
+                    src_t = self.transformations.get(src_inst.transformation_name) if src_inst else None
+                    tgt_t = self.transformations.get(tgt_inst.transformation_name) if tgt_inst else None
+                    src_table = (src_t.attributes.get("Table Name",
+                                 src_t.attributes.get("Source table name", src))
+                                 if src_t else src)
+                    tgt_table = (tgt_t.attributes.get("Table Name",
+                                 tgt_t.attributes.get("Target table name", tgt))
+                                 if tgt_t else tgt)
+                    # SCD detection
+                    upd_strat, is_scd2 = "DD_INSERT", False
+                    key_cols, hist_cols = [], []
+                    for inst_name in path:
+                        inst = self.instances.get(inst_name)
+                        t = self.transformations.get(inst.transformation_name) if inst else None
+                        if t and t.ttype == "Update Strategy":
+                            upd_strat = t.update_strategy
+                            expr_up = upd_strat.upper()
+                            if "DD_UPDATE" in expr_up or "2" in expr_up:
+                                is_scd2 = True
+                        if t and t.ttype == "Expression":
+                            for f in t.fields:
+                                n_low = f.name.lower()
+                                if any(k in n_low for k in ("_key","_id","key_col")) and f.is_output:
+                                    key_cols.append(f.name)
+                                if any(k in n_low for k in ("eff_","expir","start_dt","end_dt","curr_","hist_")) and f.is_output:
+                                    hist_cols.append(f.name)
+                    self.source_target_pairs.append(SourceTargetPair(
+                        mapping_name=self.name, folder=self.folder,
+                        source_instance=src, source_table=src_table,
+                        target_instance=tgt, target_table=tgt_table,
+                        transformations=path, is_scd2=is_scd2,
+                        scd_key_cols=key_cols, scd_hist_cols=hist_cols,
+                        update_strategy=upd_strat,
+                    ))
+
+
+@dataclass
+class SessionTask:
+    name: str
+    mapping_name: str
+    folder: str
+    source_connections: dict[str, str] = field(default_factory=dict)
+    target_connections: dict[str, str] = field(default_factory=dict)
+    parameters: dict[str, str] = field(default_factory=dict)
+    description: str = ""
+
+
+@dataclass
+class Workflow:
+    name: str
+    folder: str
+    description: str = ""
+    sessions: list[SessionTask] = field(default_factory=list)
+    parameters: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class MappingStep:
+    step_id: str; title: str; task_name: str; guid: str; task_type: str
+    wait: bool = True; max_wait: int = 604800
+    outputs: dict = field(default_factory=dict)
+    error_handler: str = "suspend"; next_step: Optional[str] = None
+
+
+@dataclass
+class Taskflow:
+    name: str; description: str
+    steps: list[MappingStep] = field(default_factory=list)
+    step_order: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# PowerMart XML Parser
+# ---------------------------------------------------------------------------
+class PowerMartParser:
+
+    def parse_file(self, xml_path: str) -> tuple[list[Mapping], list[Workflow]]:
+        try:
+            tree = ET.parse(xml_path)
+        except ET.ParseError:
+            with open(xml_path, encoding="latin-1") as fh:
+                tree = ET.parse(fh)
+        root = tree.getroot()
+        mappings:  list[Mapping]  = []
+        workflows: list[Workflow] = []
+        for repo in root.iter("REPOSITORY"):
+            for folder in repo.iter("FOLDER"):
+                fn = folder.get("NAME", "")
+                for el in folder.iter("MAPPLET"):
+                    m = self._parse_mapping_el(el, fn, True)
+                    if m: mappings.append(m)
+                for el in folder.findall("MAPPING"):
+                    m = self._parse_mapping_el(el, fn, False)
+                    if m: mappings.append(m)
+                for el in folder.findall("WORKFLOW"):
+                    w = self._parse_workflow(el, fn)
+                    if w: workflows.append(w)
+        # Detect S->T pairs after full parse
+        for m in mappings:
+            m.detect_source_target_pairs()
+        return mappings, workflows
+
+    # ------------------------------------------------------------------
+    def _parse_mapping_el(self, el: ET.Element, folder: str, is_mapplet: bool) -> Optional[Mapping]:
+        m = Mapping(name=el.get("NAME",""), folder=folder,
+                    description=el.get("DESCRIPTION",""), is_mapplet=is_mapplet)
+        for t in el.findall("TRANSFORMATION"):
+            trans = self._parse_transformation(t)
+            m.transformations[trans.name] = trans
+        for inst in el.findall("INSTANCE"):
+            i = MappingInstance(
+                name=inst.get("NAME",""),
+                transformation_name=inst.get("TRANSFORMATION_NAME", inst.get("NAME","")),
+                transformation_type=inst.get("TRANSFORMATION_TYPE",""),
+                reusable=inst.get("REUSABLE","NO").upper()=="YES",
+            )
+            m.instances[i.name] = i
+        if not m.instances:
+            for tn, tr in m.transformations.items():
+                m.instances[tn] = MappingInstance(tn, tn, tr.ttype)
+        for c in el.findall("CONNECTOR"):
+            m.connectors.append(Connector(
+                from_instance=c.get("FROMINSTANCE",""), from_field=c.get("FROMFIELD",""),
+                to_instance=c.get("TOINSTANCE",""),   to_field=c.get("TOFIELD",""),
+            ))
+        return m if (m.transformations or m.connectors) else None
+
+    def _parse_transformation(self, el: ET.Element) -> Transformation:
+        t = Transformation(name=el.get("NAME",""), ttype=el.get("TYPE",""),
+                           description=el.get("DESCRIPTION",""),
+                           reusable=el.get("REUSABLE","NO").upper()=="YES")
+        for tf in el.findall("TRANSFORMFIELD"):
+            grp = tf.get("GROUP","")
+            f = TransformField(
+                name=tf.get("NAME",""), datatype=tf.get("DATATYPE","string"),
+                port_type=tf.get("PORTTYPE","INPUT"), expression=tf.get("EXPRESSION",""),
+                precision=int(tf.get("PRECISION",4000)), scale=int(tf.get("SCALE",0)),
+                default_value=tf.get("DEFAULTVALUE",""), description=tf.get("DESCRIPTION",""),
+                group_name=grp,
+            )
+            t.fields.append(f)
+            if grp:
+                t.groups.setdefault(grp, []).append(f)
+        # Router groups from GROUPFILTER elements
+        for gf in el.findall("GROUPFILTER"):
+            grp = gf.get("NAME","")
+            cond = gf.get("CONDITION","")
+            t.attributes[f"__group_filter_{grp}"] = cond
+        for ta in el.findall("TABLEATTRIBUTE"):
+            t.attributes[ta.get("NAME","")] = ta.get("VALUE","")
+        return t
+
+    def _parse_workflow(self, el: ET.Element, folder: str) -> Optional[Workflow]:
+        wf = Workflow(name=el.get("NAME",""), folder=folder, description=el.get("DESCRIPTION",""))
+        for task in el.iter("TASKINSTANCE"):
+            if task.get("TASKTYPE","") == "SESSION":
+                s = self._parse_session(task, folder)
+                if s: wf.sessions.append(s)
+        for sess_el in el.findall("SESSION"):
+            s = self._parse_session_el(sess_el, folder)
+            if s: wf.sessions.append(s)
+        return wf if wf.sessions else None
+
+    def _parse_session(self, el: ET.Element, folder: str) -> Optional[SessionTask]:
+        name = el.get("NAME", el.get("TASKNAME",""))
+        mapping, src_c, tgt_c, params = "", {}, {}, {}
+        for attr in el.findall("ATTRIBUTE"):
+            an, av = attr.get("NAME",""), attr.get("VALUE","")
+            if an == "Mapping name": mapping = av
+            elif "source" in an.lower() and "connection" in an.lower(): src_c[an] = av
+            elif "target" in an.lower() and "connection" in an.lower(): tgt_c[an] = av
+            else: params[an] = av
+        return SessionTask(name=name, mapping_name=mapping, folder=folder,
+                           source_connections=src_c, target_connections=tgt_c, parameters=params)
+
+    def _parse_session_el(self, el: ET.Element, folder: str) -> Optional[SessionTask]:
+        name = el.get("NAME",""); mapping = el.get("MAPPINGNAME","")
+        src_c, tgt_c, params = {}, {}, {}
+        for attr in el.findall(".//ATTRIBUTE"):
+            an, av = attr.get("NAME",""), attr.get("VALUE","")
+            if "source" in an.lower() and "connection" in an.lower(): src_c[an] = av
+            elif "target" in an.lower() and "connection" in an.lower(): tgt_c[an] = av
+            else: params[an] = av
+        return SessionTask(name=name, mapping_name=mapping, folder=folder,
+                           source_connections=src_c, target_connections=tgt_c, parameters=params)
+
+
+# ---------------------------------------------------------------------------
+# Parameter file parser
+# ---------------------------------------------------------------------------
+class ParameterFileParser:
+    def parse_file(self, path: str) -> dict[str, dict[str, str]]:
+        catalog: dict[str, dict[str, str]] = {}
+        current: dict[str, str] = {}
+        section = "__global__"
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"): continue
+                if line.startswith("[") and line.endswith("]"):
+                    catalog[section] = current
+                    section = line[1:-1]
+                    current = catalog.setdefault(section, {})
+                elif "=" in line:
+                    k, _, v = line.partition("=")
+                    current[k.strip()] = v.strip()
+        catalog[section] = current
+        return catalog
+
+    def parse_dir(self, path: str) -> dict[str, dict[str, str]]:
+        all_p: dict[str, dict[str, str]] = {}
+        for f in collect_files(path, (".par",".properties",".param")):
+            all_p.update(self.parse_file(f))
+        return all_p
+
+    def flat_params(self, catalog: dict) -> dict[str, str]:
+        """Merge all sections into one flat $$KEY->value dict."""
+        flat: dict[str, str] = {}
+        for section_vals in catalog.values():
+            for k, v in section_vals.items():
+                flat[k] = v
+        return flat
+
+
+# ---------------------------------------------------------------------------
+# IICS Taskflow Parser
+# ---------------------------------------------------------------------------
+class InformaticaTaskflowParser:
+
+    def parse_file(self, xml_path: str) -> Taskflow:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        entry   = root.find(".//{%s}Entry" % NS["repo"])
+        tf_root = entry.find("{%s}taskflow" % NS["sf"]) if entry is not None else None
+        if tf_root is None:
+            tf_root = root.find(".//{%s}taskflow" % NS["sf"])
+        if tf_root is None:
+            raise ValueError(f"No <taskflow> in {xml_path}")
+        name    = tf_root.get("name", Path(xml_path).stem)
+        desc_el = tf_root.find("{%s}description" % NS["sf"])
+        description = desc_el.text.strip() if desc_el is not None and desc_el.text else ""
+        tf = Taskflow(name=name, description=description)
+        self._parse_flow(tf_root, tf)
+        return tf
+
+    def _parse_flow(self, tf_root, tf):
+        flow = tf_root.find("{%s}flow" % NS["sf"])
+        if flow is None: return
+        containers = {ec.get("id"): ec for ec in flow.findall("{%s}eventContainer" % NS["sf"])}
+        start = flow.find("{%s}start" % NS["sf"])
+        ids = []
+        if start is not None:
+            cur = self._link(start)
+            while cur and cur in containers:
+                ids.append(cur); cur = self._link(containers[cur])
+        tf.step_order = ids
+        for eid in ids:
+            s = self._parse_ec(eid, containers[eid])
+            if s: tf.steps.append(s)
+
+    def _link(self, el) -> Optional[str]:
+        lnk = el.find("{%s}link" % NS["sf"])
+        return lnk.get("targetId") if lnk is not None else None
+
+    def _parse_ec(self, ec_id, ec) -> Optional[MappingStep]:
+        svc = ec.find("{%s}service" % NS["sf"])
+        if svc is None: return None
+        title = (svc.findtext("{%s}title" % NS["sf"]) or "").strip()
+        params = {}
+        si = svc.find("{%s}serviceInput" % NS["sf"])
+        if si is not None:
+            for p in si.findall("{%s}parameter" % NS["sf"]):
+                params[p.get("name","")] = p.text or ""
+        outputs = {}
+        so = svc.find("{%s}serviceOutput" % NS["sf"])
+        if so is not None:
+            for op in so.findall("{%s}operation" % NS["sf"]):
+                col = re.sub(r"^temp\.[^/]+/output/","", op.get("to",""))
+                outputs[col] = op.text or ""
+        error_handler = "suspend"
+        events = ec.find("{%s}events" % NS["sf"])
+        if events is not None:
+            for catch in events.findall("{%s}catch" % NS["sf"]):
+                if catch.get("name") == "error":
+                    error_handler = "suspend" if catch.find("{%s}suspend" % NS["sf"]) is not None else "continue"
+        return MappingStep(
+            step_id=ec_id, title=title or params.get("Task Name",""),
+            task_name=params.get("Task Name",""), guid=params.get("GUID",""),
+            task_type=params.get("Task Type","MCT"),
+            wait=params.get("Wait for Task to Complete","true").lower()=="true",
+            max_wait=int(params.get("Max Wait","604800")),
+            outputs=outputs, error_handler=error_handler, next_step=self._link(ec),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Project JSON parser
+# ---------------------------------------------------------------------------
+class ProjectJsonParser:
+    def parse_file(self, json_path: str) -> dict:
+        with open(json_path, encoding="utf-8") as f:
+            data = json.load(f)
+        props = {p["name"]: p["value"] for p in data.get("properties",[]) if "name" in p}
+        return {"id": props.get("id",""), "name": props.get("name",""),
+                "description": props.get("description",""),
+                "owner": props.get("owner",""), "created": props.get("createdTime",""),
+                "modified": props.get("lastUpdatedTime",""), "state": props.get("documentState","")}
+
+
+# ---------------------------------------------------------------------------
+# dbt / DuckDB Generator
+# ---------------------------------------------------------------------------
+class DbtGenerator:
+
+    ICS_COLS: dict[str, str] = {
+        "Object_Name":"varchar","Run_Id":"bigint","Log_Id":"bigint","Task_Id":"varchar",
+        "Task_Status":"varchar","Success_Source_Rows":"bigint","Failed_Source_Rows":"bigint",
+        "Success_Target_Rows":"bigint","Failed_Target_Rows":"bigint",
+        "Start_Time":"timestamp","End_Time":"timestamp","Error_Message":"varchar",
+        "TotalTransErrors":"bigint","FirstErrorCode":"varchar",
+    }
+
+    def __init__(self, out_dir: str = "./dbt_output", flat_params: Optional[dict] = None):
+        self.out    = Path(out_dir)
+        self.xp     = ExpressionTranspiler(flat_params or {})
+        self.params = flat_params or {}
+
+    # ------------------------------------------------------------------
+    def generate(self, taskflows, mappings, workflows,
+                 project_meta=None, connections=None, params=None):
+        for d in ("models/staging","models/intermediate","models/marts","seeds","macros","analyses"):
+            (self.out / d).mkdir(parents=True, exist_ok=True)
+
+        self._write_dbt_project(project_meta)
+        self._write_profiles(connections)
+        self._write_macros()
+
+        all_meta: list[dict] = []
+        all_sources: list[dict] = []
+
+        # --- Mappings: one model per source->target pair ---
+        for m in mappings:
+            meta, srcs = self._write_mapping_models(m)
+            all_meta.extend(meta); all_sources.extend(srcs)
+
+        # --- Taskflows ---
+        for tf in taskflows:
+            meta = self._write_tf_model(tf)
+            all_meta.extend(meta)
+            all_sources.extend([{"name": _snake(s.task_name),
+                                  "description": f"Raw for {s.task_name}"} for s in tf.steps])
+
+        # --- Workflows ---
+        for wf in workflows:
+            all_meta.extend(self._write_workflow_model(wf, params or {}))
+
+        self._write_schema_yml(all_meta)
+        self._write_sources_yml(all_sources)
+        self._write_seed_ddl(taskflows, mappings, workflows)
+        self._write_lineage_report(mappings, taskflows, workflows, project_meta, connections, params)
+
+        print(f"\n  Generated dbt project -> {self.out.resolve()}")
+        print(f"   models/  - {len(all_meta)} SQL model(s)")
+        print(f"   seeds/   - raw DDL")
+
+    # ------------------------------------------------------------------
+    # dbt_project.yml
+    # ------------------------------------------------------------------
+    def _write_dbt_project(self, project_meta):
+        proj = _snake(project_meta["name"]) if project_meta else "informatica_to_dbt"
+        desc = f"# {project_meta.get('description','')}" if project_meta else ""
+        _write(self.out / "dbt_project.yml", textwrap.dedent(f"""\
+            name: {proj}
+            version: "1.0.0"
+            config-version: 2
+            {desc}
+            profile: duckdb_local
+            model-paths: ["models"]
+            seed-paths:  ["seeds"]
+            macro-paths: ["macros"]
+            target-path: "target"
+            clean-targets: ["target","dbt_packages"]
+            vars:
+              run_id: 0
+              log_id: 0
+            models:
+              {proj}:
+                staging:
+                  +materialized: view
+                  +schema: staging
+                intermediate:
+                  +materialized: ephemeral
+                marts:
+                  +materialized: table
+                  +schema: marts
+        """))
+
+    def _write_profiles(self, connections=None):
+        note = "  # connections: " + ", ".join(c["name"] for c in (connections or [])[:4]) if connections else ""
+        _write(self.out / "profiles.yml", textwrap.dedent(f"""\
+            duckdb_local:
+              target: dev
+              outputs:
+                dev:
+                  type: duckdb
+                  path: "dev.duckdb"
+                  schema: main
+                  threads: 4
+                  {note}
+                prod:
+                  type: duckdb
+                  path: "prod.duckdb"
+                  schema: main
+                  threads: 8
+        """))
+
+    def _write_macros(self):
+        _write(self.out / "macros" / "run_ics_task.sql", textwrap.dedent("""\
+            {% macro run_ics_task(task_name, guid, task_type='MCT') %}
+                select '{{ task_name }}' as object_name,
+                    {{ var('run_id',0) }}::bigint as run_id,
+                    {{ var('log_id',0) }}::bigint as log_id,
+                    '{{ guid }}' as task_id, 'SUCCEEDED' as task_status,
+                    0::bigint as success_source_rows, 0::bigint as failed_source_rows,
+                    0::bigint as success_target_rows, 0::bigint as failed_target_rows,
+                    current_timestamp as start_time, current_timestamp as end_time,
+                    null::varchar as error_message,
+                    0::bigint as total_trans_errors, null::varchar as first_error_code
+            {% endmacro %}
+        """))
+        _write(self.out / "macros" / "infa_lookup.sql", textwrap.dedent("""\
+            {% macro infa_lookup(table, condition, cols) %}
+                (select {{ cols | join(', ') }} from {{ table }} where {{ condition }} limit 1)
+            {% endmacro %}
+        """))
+        _write(self.out / "macros" / "iif.sql", textwrap.dedent("""\
+            {% macro iif(cond, t, f) %}CASE WHEN {{ cond }} THEN {{ t }} ELSE {{ f }} END{% endmacro %}
+        """))
+        _write(self.out / "macros" / "scd2_merge.sql", textwrap.dedent("""\
+            {#
+              Macro: scd2_merge
+              Implements SCD Type 2 merge pattern in DuckDB.
+              Args:
+                target_table  - fully qualified target table
+                source_ref    - dbt ref() or source() expression
+                key_cols      - list of business key column names
+                hist_cols     - list of columns that trigger new version on change
+                eff_from_col  - effective-from date column name
+                eff_to_col    - effective-to date column name
+                curr_flag_col - current-record flag column name
+            #}
+            {% macro scd2_merge(target_table, source_ref, key_cols, hist_cols,
+                                eff_from_col='eff_from_dt', eff_to_col='eff_to_dt',
+                                curr_flag_col='curr_indc') %}
+
+            -- Step 1: expire changed rows
+            UPDATE {{ target_table }} tgt
+            SET    {{ eff_to_col }}    = (select min({{ eff_from_col }}) from {{ source_ref }} src
+                                           where {{ key_cols | map('tgt.'~x) | join(' AND ') }}),
+                   {{ curr_flag_col }} = 0
+            WHERE  {{ curr_flag_col }} = 1
+              AND  EXISTS (
+                select 1 from {{ source_ref }} src
+                where {{ key_cols | map('src.'~x~' = tgt.'~x) | join(' AND ') }}
+                  and ({{ hist_cols | map('src.'~x~' <> tgt.'~x) | join(' OR ') }})
+              );
+
+            -- Step 2: insert new / changed rows
+            INSERT INTO {{ target_table }}
+            select src.*
+            from {{ source_ref }} src
+            where not exists (
+                select 1 from {{ target_table }} tgt
+                where {{ key_cols | map('src.'~x~' = tgt.'~x) | join(' AND ') }}
+                  and {{ curr_flag_col }} = 1
+                  and ({{ hist_cols | map('src.'~x~' = tgt.'~x) | join(' AND ') }})
+            );
+            {% endmacro %}
+        """))
+
+    # ------------------------------------------------------------------
+    # Core: one model per source->target pair
+    # ------------------------------------------------------------------
+    def _write_mapping_models(self, m: Mapping) -> tuple[list[dict], list[dict]]:
+        meta_list: list[dict] = []
+        all_sources: list[dict] = []
+
+        # Always generate the base CTE model (all transformations)
+        base_name = f"{'mplt' if m.is_mapplet else 'stg'}_{_snake(m.name)}"
+        base_sql  = self._mapping_base_sql(m, base_name)
+        _write(self.out / "models" / "staging" / f"{base_name}.sql", base_sql)
+        out_cols = self._output_columns(m)
+        meta_list.append({"name": base_name,
+                           "description": m.description or f"Base CTE model for mapping '{m.name}' (folder: {m.folder}).",
+                           "columns": out_cols, "layer": "staging"})
+
+        # Collect sources
+        for inst_name, inst in m.instances.items():
+            t = m.transformations.get(inst.transformation_name)
+            if t and t.ttype in ("Input Transformation","Source Qualifier","Source Definition"):
+                tbl = t.attributes.get("Table Name", t.attributes.get("Source table name", inst_name))
+                all_sources.append({"name": _snake(tbl), "description": f"Source for {m.name}/{inst_name}"})
+
+        # Per source->target pair
+        for idx, pair in enumerate(m.source_target_pairs):
+            pair_name = (f"{'mart' if pair.is_scd2 else 'stg'}_{_snake(m.name)}"
+                         f"__{_snake(pair.source_table)}_to_{_snake(pair.target_table)}")
+            if len(pair_name) > 100:
+                pair_name = f"stg_{_snake(m.name)}__pair_{idx+1}"
+
+            if pair.is_scd2:
+                sql = self._scd2_model_sql(m, pair, pair_name)
+                layer = "marts"
+            else:
+                sql = self._pair_model_sql(m, pair, pair_name, base_name)
+                layer = "staging"
+
+            subdir = "marts" if layer == "marts" else "staging"
+            _write(self.out / "models" / subdir / f"{pair_name}.sql", sql)
+            meta_list.append({
+                "name": pair_name,
+                "description": (
+                    f"{'SCD2 ' if pair.is_scd2 else ''}Source->Target: "
+                    f"`{pair.source_table}` -> `{pair.target_table}` "
+                    f"in mapping `{m.name}`."
+                ),
+                "columns": out_cols,
+                "layer": layer,
+            })
+
+        return meta_list, all_sources
+
+    # ------------------------------------------------------------------
+    def _mapping_base_sql(self, m: Mapping, model_name: str) -> str:
+        """Full CTE chain covering every transformation in topo order."""
+        ordered  = m.topo_sort()
+        upstream: dict[str, list[Connector]] = {n: [] for n in m.instances}
+        for c in m.connectors:
+            if c.to_instance in upstream:
+                upstream[c.to_instance].append(c)
+
+        header = textwrap.dedent(f"""\
+            {{# -----------------------------------------------------------
+               Model   : {model_name}
+               Mapping : {m.name}  ({'Mapplet' if m.is_mapplet else 'Mapping'})
+               Folder  : {m.folder}
+               Desc    : {m.description or 'n/a'}
+               S->T pairs: {len(m.source_target_pairs)}
+            ----------------------------------------------------------- #}}
+            {{{{ config(materialized='view') }}}}
+        """)
+
+        ctes = [cte for n in ordered
+                if (inst := m.instances.get(n))
+                and (t := m.transformations.get(inst.transformation_name))
+                for cte in [self._instance_to_cte(n, inst, t, upstream, m)]
+                if cte]
+
+        if not ctes:
+            return header + "\nselect 1 as placeholder\n"
+
+        final = next(
+            (n for n in reversed(ordered)
+             if m.instances.get(n)
+             and m.transformations.get(m.instances[n].transformation_name)
+             and m.transformations[m.instances[n].transformation_name].ttype
+             in ("Output Transformation","Target Definition")),
+            ordered[-1] if ordered else "placeholder"
+        )
+        return header + "\nwith\n\n" + ",\n\n".join(ctes) + f"\n\nselect * from {_snake(final)}\n"
+
+    # ------------------------------------------------------------------
+    def _pair_model_sql(self, m: Mapping, pair: SourceTargetPair,
+                         model_name: str, base_ref: str) -> str:
+        """Thin model that filters the base model to one S->T flow."""
+        upd = pair.update_strategy.upper()
+        if "DD_DELETE" in upd:
+            where = "-- DELETE strategy: filter rows flagged for deletion"
+            comment = "-- DuckDB: implement DELETE via MERGE or soft-delete flag"
+        elif "DD_UPDATE" in upd:
+            where = "-- UPDATE strategy"
+            comment = "-- DuckDB: implement via MERGE INTO or INSERT ... ON CONFLICT"
+        else:
+            where = ""; comment = ""
+
+        upstream_instances = ", ".join(f"`{n}`" for n in pair.transformations)
+        return textwrap.dedent(f"""\
+            {{# -----------------------------------------------------------
+               Model   : {model_name}
+               Source  : {pair.source_table}
+               Target  : {pair.target_table}
+               Path    : {upstream_instances}
+               Strategy: {pair.update_strategy}
+            ----------------------------------------------------------- #}}
+            {{{{ config(materialized='table') }}}}
+
+            with base as (
+                select * from {{{{ ref('{base_ref}') }}}}
+            )
+
+            {comment}
+            select *
+            from base
+            {where}
+            -- Target: {pair.target_table}
+        """)
+
+    # ------------------------------------------------------------------
+    def _scd2_model_sql(self, m: Mapping, pair: SourceTargetPair, model_name: str) -> str:
+        """SCD Type 2 model with effective dates, current flag, and merge macro."""
+        key_cols  = pair.scd_key_cols or ["id"]
+        hist_cols = pair.scd_hist_cols or ["updated_at"]
+        base_ref  = f"stg_{_snake(m.name)}"
+        ordered   = m.topo_sort()
+        upstream: dict[str, list[Connector]] = {n: [] for n in m.instances}
+        for c in m.connectors:
+            if c.to_instance in upstream:
+                upstream[c.to_instance].append(c)
+
+        # Build CTEs only for the path in this pair
+        path_set = set(pair.transformations)
+        ctes = [cte for n in ordered
+                if n in path_set
+                and (inst := m.instances.get(n))
+                and (t := m.transformations.get(inst.transformation_name))
+                for cte in [self._instance_to_cte(n, inst, t, upstream, m)]
+                if cte]
+
+        cte_sql = (",\n\n".join(ctes) + ",\n\n") if ctes else ""
+        tgt_tbl = _snake(pair.target_table)
+        key_list = ", ".join(key_cols)
+        hist_list = ", ".join(hist_cols)
+
+        return textwrap.dedent(f"""\
+            {{# -----------------------------------------------------------
+               Model   : {model_name}  [SCD TYPE 2]
+               Source  : {pair.source_table}
+               Target  : {pair.target_table}
+               Keys    : {key_list}
+               History : {hist_list}
+            ----------------------------------------------------------- #}}
+            {{{{ config(
+                materialized = 'incremental',
+                unique_key   = [{', '.join(repr(k) for k in key_cols)}],
+                incremental_strategy = 'merge',
+            ) }}}}
+
+            with
+            {cte_sql}
+            source_data as (
+                select * from {{{{ ref('{base_ref}') }}}}
+                {{%- if is_incremental() %}}
+                where updated_at > (select max(eff_from_dt) from {{{{ this }}}})
+                {{%- endif %}}
+            ),
+
+            -- Identify changed rows (SCD2 history detection)
+            classified as (
+                select
+                    src.*,
+                    case
+                        when tgt.{key_cols[0] if key_cols else 'id'} is null then 'NEW'
+                        when {" or ".join(f"src.{c} <> tgt.{c}" for c in hist_cols) if hist_cols else "false"} then 'CHANGED'
+                        else 'UNCHANGED'
+                    end as _row_action,
+                    current_timestamp   as eff_from_dt,
+                    '9999-12-31'::date  as eff_to_dt,
+                    1                   as curr_indc
+                from source_data src
+                left join {{{{ this }}}} tgt
+                    on {" and ".join(f"src.{k} = tgt.{k}" for k in key_cols) if key_cols else "false"}
+                    and tgt.curr_indc = 1
+            )
+
+            select * from classified
+            where _row_action in ('NEW','CHANGED')
+        """)
+
+    # ------------------------------------------------------------------
+    # CTE builder for every transformation type
+    # ------------------------------------------------------------------
+    def _instance_to_cte(self, inst_name, inst, t, upstream, m) -> str:
+        n    = _snake(inst_name)
+        ups  = upstream.get(inst_name, [])
+        up_n = list(dict.fromkeys(_snake(c.from_instance) for c in ups))
+        fc   = up_n[0] if up_n else "/* missing upstream */"
+
+        # ------ Source / Input ------
+        if t.ttype in ("Input Transformation","Source Qualifier","Source Definition"):
+            cols = ", ".join(f.name.lower() for f in t.outputs) or "*"
+            # Resolve $$PARAM in SQL override
+            sq_override = self.xp.transpile(
+                t.attributes.get("Sql Query", t.attributes.get("Source Filter",""))
+            )
+            src = t.attributes.get("Table Name", t.attributes.get("Source table name", inst_name))
+            src_ref = f"{{{{ source('raw', '{_snake(src)}') }}}}"
+            if sq_override and len(sq_override) > 5:
+                return (f"{n} as (\n    -- Source Qualifier SQL override\n"
+                        f"    {sq_override}\n)")
+            return f"{n} as (\n    select {cols} from {src_ref}\n)"
+
+        # ------ Target / Output ------
+        if t.ttype in ("Output Transformation","Target Definition"):
+            if not up_n: return ""
+            col_map = {c.to_field: c.from_field for c in ups}
+            cols = ", ".join(f"{col_map.get(f.name, f.name)} as {f.name.lower()}" for f in t.inputs)
+            return f"{n} as (\n    select {cols}\n    from {up_n[0]}\n)"
+
+        # ------ Expression ------
+        if t.ttype == "Expression":
+            pass_map = {c.to_field: c.from_field for c in ups}
+            parts  = [f"        {pass_map.get(f.name, f.name)} as {f.name.lower()}" for f in t.inputs]
+            parts += [f"        {self.xp.transpile(f.expression)} as {f.name.lower()}  -- local"
+                      for f in t.locals]
+            parts += [f"        {self.xp.transpile(f.expression) or f.name} as {f.name.lower()}"
+                      for f in t.outputs]
+            return (f"{n} as (\n    select\n        "
+                    + "\n        ,".join(parts)
+                    + f"\n    from {fc}\n)")
+
+        # ------ Lookup ------
+        if t.ttype == "Lookup Procedure":
+            lkp_table = t.lookup_table or "unknown_lookup"
+            condition = self.xp.transpile(t.lookup_condition)
+            ret_cols  = [f.name.lower() for f in t.fields
+                         if "RETURN" in f.port_type or ("OUTPUT" in f.port_type and "LOOKUP" in f.port_type)]
+            ret_sql   = ", ".join(f"lkp.{c}" for c in ret_cols) or "lkp.*"
+            # Inline SQL override with param substitution
+            if t.lookup_sql:
+                lkp_src = f"(\n        {self.xp.transpile(t.lookup_sql).strip()}\n    )"
+            else:
+                lkp_src = f"{{{{ source('raw', '{_snake(lkp_table)}') }}}}"
+            conn  = t.attributes.get("Connection Information","")
+            cache = t.attributes.get("Lookup caching enabled","NO")
+            return (f"{n} as (\n"
+                    f"    -- Lookup: {lkp_table}  conn:{conn}  cache:{cache}\n"
+                    f"    select src.*, {ret_sql}\n    from {fc} src\n"
+                    f"    left join {lkp_src} lkp\n"
+                    f"        on {condition or '/* add condition */'}\n)")
+
+        # ------ Filter ------
+        if t.ttype == "Filter":
+            cond = self.xp.transpile(t.filter_condition) or "TRUE"
+            return f"{n} as (\n    select * from {fc}\n    where {cond}\n)"
+
+        # ------ Joiner ------
+        if t.ttype == "Joiner":
+            d2    = up_n[1] if len(up_n) > 1 else "/* detail_src */"
+            jc    = self.xp.transpile(t.attributes.get("Join Condition","TRUE"))
+            jtype = t.attributes.get("Join Type","Normal").upper()
+            sjoin = {"NORMAL":"INNER JOIN","MASTER OUTER":"LEFT JOIN",
+                     "DETAIL OUTER":"RIGHT JOIN","FULL OUTER":"FULL OUTER JOIN"}.get(jtype,"INNER JOIN")
+            # Explicit column list to avoid duplicate column names
+            master_cols = ", ".join(f"m.{f.name.lower()}" for f in
+                                    (m.transformations.get(m.instances[up_n[0]].transformation_name).outputs
+                                     if up_n and m.instances.get(up_n[0]) else []))
+            return (f"{n} as (\n    -- Joiner ({jtype})\n"
+                    f"    select m.*, d.*\n    from {fc} m\n"
+                    f"    {sjoin} {d2} d on {jc}\n)")
+
+        # ------ Aggregator ------
+        if t.ttype == "Aggregator":
+            gc    = [f.name.lower() for f in t.inputs  if not f.expression]
+            ag    = [f"        {self.xp.transpile(f.expression)} as {f.name.lower()}"
+                     for f in t.outputs if f.expression]
+            group = f"    group by {', '.join(gc)}" if gc else ""
+            return (f"{n} as (\n    select\n        {', '.join(gc)}"
+                    + (("\n        ," + "\n        ,".join(ag)) if ag else "")
+                    + f"\n    from {fc}\n    {group}\n)")
+
+        # ------ Router ------
+        if t.ttype == "Router":
+            # Emit one CTE per output group
+            ctes_out = []
+            for grp_name, filter_key in [(k.replace("__group_filter_",""), v)
+                                          for k, v in t.attributes.items()
+                                          if k.startswith("__group_filter_")]:
+                cond = self.xp.transpile(filter_key) or "TRUE"
+                cte_grp = f"{n}_{_snake(grp_name)}"
+                ctes_out.append(
+                    f"{cte_grp} as (\n    select * from {fc}\n    where {cond}\n)"
+                )
+            # Default group catches everything else
+            ctes_out.append(f"{n}_default as (\n    select * from {fc}\n)")
+            return ",\n\n".join(ctes_out)
+
+        # ------ Sequence Generator ------
+        if t.ttype == "Sequence Generator":
+            start = t.seq_start; inc = t.seq_increment
+            out_col = t.outputs[0].name.lower() if t.outputs else "nextval"
+            return (f"{n} as (\n"
+                    f"    -- Sequence: start={start} increment={inc}\n"
+                    f"    select *, {start} + (row_number() over () - 1) * {inc} as {out_col}\n"
+                    f"    from {fc}\n)")
+
+        # ------ Rank ------
+        if t.ttype == "Rank":
+            rank_col  = t.rank_by or (t.inputs[0].name.lower() if t.inputs else "1")
+            rank_expr = self.xp.transpile(rank_col)
+            top_n     = t.rank_count
+            grp_cols  = [f.name.lower() for f in t.inputs if not f.expression and f.name.lower() != _snake(rank_col)]
+            part_sql  = f"partition by {', '.join(grp_cols)}" if grp_cols else ""
+            rank_col_out = (t.outputs[0].name.lower() if t.outputs else "rank_val")
+            return (f"{n}_ranked as (\n"
+                    f"    select *,\n"
+                    f"           rank() over ({part_sql} order by {rank_expr} desc) as _rnk\n"
+                    f"    from {fc}\n),\n"
+                    f"{n} as (\n    select * from {n}_ranked where _rnk <= {top_n}\n)")
+
+        # ------ Update Strategy ------
+        if t.ttype == "Update Strategy":
+            expr = self.xp.transpile(t.update_strategy)
+            return (f"{n} as (\n"
+                    f"    -- Update Strategy: {t.update_strategy}\n"
+                    f"    -- DuckDB: flag rows; apply via MERGE INTO target\n"
+                    f"    select *,\n"
+                    f"           {expr} as _update_strategy_flag\n"
+                    f"    from {fc}\n)")
+
+        # ------ Stored Procedure ------
+        if t.ttype == "Stored Procedure":
+            ic = ", ".join(f.name.lower() for f in t.inputs)
+            oc = ", ".join(f"null::{f.duckdb_type} as {f.name.lower()}" for f in t.outputs)
+            conn = t.attributes.get("Connection Information","$Target")
+            return (f"{n} as (\n    -- SP: {t.sp_name}({ic})  conn:{conn}\n"
+                    f"    -- TODO: implement as DuckDB macro / UDF\n"
+                    f"    select src.*, {oc or 'null as proc_result'}\n"
+                    f"    from {fc} src\n)")
+
+        # ------ Normalizer ------
+        if t.ttype in ("Normalizer","Normalizer Transformation"):
+            occur = t.normalizer_occur
+            # UNPIVOT pattern: repeat N times
+            unions = []
+            for i in range(1, occur + 1):
+                cols = ", ".join(
+                    f"{f.name.lower()}_{i} as {f.name.lower()}"
+                    if any(f.name.lower()+f"_{j}" in [ff.name.lower() for ff in t.inputs]
+                           for j in range(1, occur+1))
+                    else f.name.lower()
+                    for f in t.inputs
+                )
+                unions.append(f"    select {cols or '*'}, {i} as occurrence_num from {fc}")
+            return (f"{n} as (\n"
+                    + "\n    union all\n".join(unions)
+                    + "\n)")
+
+        # ------ Mapplet instance ------
+        if t.ttype == "Mapplet":
+            ref = f"mplt_{_snake(inst.transformation_name)}"
+            return (f"{n} as (\n    -- Mapplet: {inst.transformation_name}\n"
+                    f"    select * from {{{{ ref('{ref}') }}}}\n    -- TODO: pass inputs from {fc}\n)")
+
+        # ------ Fallback ------
+        return f"{n} as (\n    -- {t.ttype}: {inst_name} (pass-through)\n    select * from {fc}\n)"
+
+    # ------------------------------------------------------------------
+    def _output_columns(self, m: Mapping) -> list[dict]:
+        for inst_name in reversed(m.topo_sort()):
+            inst = m.instances.get(inst_name)
+            if not inst: continue
+            t = m.transformations.get(inst.transformation_name)
+            if t and t.ttype in ("Output Transformation","Target Definition"):
+                return [{"name": f.name.lower(), "dtype": f.duckdb_type,
+                          "description": f.description} for f in t.inputs]
+        for inst_name in reversed(m.topo_sort()):
+            inst = m.instances.get(inst_name)
+            if not inst: continue
+            t = m.transformations.get(inst.transformation_name)
+            if t and t.outputs:
+                return [{"name": f.name.lower(), "dtype": f.duckdb_type,
+                          "description": f.description} for f in t.outputs]
+        return []
+
+    # ------------------------------------------------------------------
+    # Taskflow models
+    # ------------------------------------------------------------------
+    def _write_tf_model(self, tf: Taskflow) -> list[dict]:
+        meta: list[dict] = []
+        for step in tf.steps:
+            mn  = f"stg_{_snake(step.task_name)}"
+            cds = ",\n    ".join(f"{c}::{d}  as {c.lower()}" for c, d in self.ICS_COLS.items())
+            sql = textwrap.dedent(f"""\
+                {{# Task: {step.task_name} | TF: {tf.name} #}}
+                {{{{ config(materialized='view') }}}}
+                with ics_raw as (
+                    {{{{ run_ics_task(task_name='{step.task_name}', guid='{step.guid}',
+                                task_type='{step.task_type}') }}}}
+                ),
+                typed as (select {cds} from ics_raw)
+                select * from typed
+            """)
+            _write(self.out / "models" / "staging" / f"{mn}.sql", sql)
+            meta.append({"name": mn,
+                          "description": f"Task '{step.task_name}' from taskflow '{tf.name}'.",
+                          "columns": [{"name": c.lower(), "dtype": d, "description": ""}
+                                      for c, d in self.ICS_COLS.items()], "layer": "staging"})
+        orch = f"int_{_snake(tf.name)}_audit"
+        unions = [f"    select {i} as step_order,'{s.task_name}' as task_name,* "
+                  f"from {{{{ ref('stg_{_snake(s.task_name)}') }}}}"
+                  for i, s in enumerate(tf.steps, 1)] or ["    select null,null"]
+        _write(self.out / "models" / "intermediate" / f"{orch}.sql", textwrap.dedent(f"""\
+            {{{{ config(materialized='table') }}}}
+            with steps as ({"    union all".join(unions)})
+            select step_order,task_name,task_status,
+                   success_source_rows,failed_source_rows,success_target_rows,failed_target_rows,
+                   total_trans_errors,first_error_code,error_message,start_time,end_time,
+                   datediff('second',start_time,end_time) as duration_seconds,
+                   run_id,log_id,task_id,object_name
+            from steps order by step_order
+        """))
+        meta.append({"name": orch, "description": f"Audit for taskflow '{tf.name}'.",
+                      "columns": [{"name": c, "dtype": "varchar", "description": ""}
+                                  for c in ["step_order","task_name","task_status","duration_seconds"]],
+                      "layer": "intermediate"})
+        return meta
+
+    # ------------------------------------------------------------------
+    # Workflow model
+    # ------------------------------------------------------------------
+    def _write_workflow_model(self, wf: Workflow, params: dict) -> list[dict]:
+        model_name = f"int_{_snake(wf.name)}_wf_audit"
+        flat = {}
+        for sec_vals in params.values():
+            flat.update(sec_vals)
+        unions = []
+        for i, sess in enumerate(wf.sessions, 1):
+            src_c = self._resolve_param(next(iter(sess.source_connections.values()),""), flat)
+            tgt_c = self._resolve_param(next(iter(sess.target_connections.values()),""), flat)
+            ref   = f"stg_{_snake(sess.mapping_name)}" if sess.mapping_name else "/* no mapping */"
+            unions.append(
+                f"    select {i} as step_order, '{sess.name}' as session_name,\n"
+                f"           '{sess.mapping_name}' as mapping_name,\n"
+                f"           '{src_c}' as source_connection,\n"
+                f"           '{tgt_c}' as target_connection,\n"
+                f"           current_timestamp as created_at\n"
+                f"    -- ref: {{{{ ref('{ref}') }}}}"
+            )
+        union_sql = "\n    union all\n".join(unions) or "    select null as step_order"
+        sql = textwrap.dedent(f"""\
+            {{# Workflow: {wf.name} | Folder: {wf.folder} #}}
+            {{{{ config(materialized='table') }}}}
+            with sessions as (
+            {union_sql}
+            )
+            select step_order,session_name,mapping_name,source_connection,target_connection,created_at
+            from sessions order by step_order
+        """)
+        _write(self.out / "models" / "intermediate" / f"{model_name}.sql", sql)
+        return [{"name": model_name,
+                 "description": wf.description or f"Audit for workflow '{wf.name}'.",
+                 "columns": [{"name": c,"dtype":"varchar","description":""}
+                              for c in ["step_order","session_name","mapping_name",
+                                        "source_connection","target_connection"]],
+                 "layer": "intermediate"}]
+
+    @staticmethod
+    def _resolve_param(val: str, flat: dict) -> str:
+        if not val: return val
+        for k, v in flat.items():
+            val = val.replace(k, v)
+        return val
+
+    # ------------------------------------------------------------------
+    # schema.yml
+    # ------------------------------------------------------------------
+    def _write_schema_yml(self, meta: list[dict]):
+        lines = ["version: 2","","models:"]
+        for m in meta:
+            lines += [f"  - name: {m['name']}","    description: >",
+                      f"      {m['description']}","    columns:"]
+            for col in m.get("columns",[]):
+                cn = col["name"] if isinstance(col,dict) else col.lower()
+                lines.append(f"      - name: {cn}")
+                if cn in ("run_id","log_id"):
+                    lines += ["        tests:","          - not_null"]
+                if cn == "task_status":
+                    lines += ["        tests:","          - accepted_values:",
+                              "              values: ['SUCCEEDED','FAILED','RUNNING','STOPPED']"]
+            lines.append("")
+        _write(self.out / "models" / "schema.yml", "\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # sources.yml
+    # ------------------------------------------------------------------
+    def _write_sources_yml(self, sources: list[dict]):
+        seen: set[str] = set()
+        lines = ["version: 2","","sources:","  - name: raw",
+                 "    description: Raw landing schema","    database: dev",
+                 "    schema: raw","    tables:"]
+        for s in sources:
+            if s["name"] in seen: continue
+            seen.add(s["name"])
+            lines += [f"      - name: {s['name']}",
+                      f"        description: \"{s['description']}\""]
+        _write(self.out / "models" / "sources.yml", "\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # Seed DDL
+    # ------------------------------------------------------------------
+    def _write_seed_ddl(self, taskflows, mappings, workflows):
+        ics = ",\n    ".join(f"{c.lower()}  {d}" for c, d in self.ICS_COLS.items())
+        blocks = ["-- Auto-generated DuckDB DDL\nCREATE SCHEMA IF NOT EXISTS raw;\n"]
+        for m in mappings:
+            for inst_name, inst in m.instances.items():
+                t = m.transformations.get(inst.transformation_name)
+                if t and t.ttype in ("Input Transformation","Source Qualifier","Source Definition"):
+                    tbl = t.attributes.get("Table Name", inst_name)
+                    col_block = ",\n    ".join(
+                        f"{f.name.lower()}  {f.duckdb_type}" for f in t.outputs
+                    ) or "id integer"
+                    blocks.append(
+                        f"-- Mapping: {m.name} / {inst_name}\n"
+                        f"CREATE TABLE IF NOT EXISTS raw.{_snake(tbl)} (\n"
+                        f"    {col_block},\n    _loaded_at timestamp default current_timestamp\n);\n"
+                    )
+        for tf in taskflows:
+            for step in tf.steps:
+                blocks.append(
+                    f"CREATE TABLE IF NOT EXISTS raw.{_snake(step.task_name)} (\n"
+                    f"    {ics},\n    _loaded_at timestamp default current_timestamp\n);\n"
+                )
+        _write(self.out / "seeds" / "create_raw_tables.sql", "\n".join(blocks))
+
+    # ------------------------------------------------------------------
+    # Lineage report
+    # ------------------------------------------------------------------
+    def _write_lineage_report(self, mappings, taskflows, workflows,
+                               project_meta, connections, params):
+        lines = ["# Informatica -> dbt Lineage Report\n"]
+        if project_meta:
+            lines += [f"**Project:** {project_meta['name']}",
+                      f"**Description:** {project_meta.get('description','')}",""]
+        if connections:
+            lines += ["## Connections\n","| Name | Type | Host | Database |",
+                      "|------|------|------|----------|"]
+            for c in connections:
+                lines.append(f"| {c['name']} | {c.get('type','')} | {c.get('host','')} | {c.get('database','')} |")
+            lines.append("")
+        lines.append("## Mappings\n")
+        for m in mappings:
+            ordered = m.topo_sort()
+            dag = " -> ".join(
+                f"`{n}` ({m.transformations.get(m.instances[n].transformation_name).ttype if m.instances.get(n) else '?'})"
+                for n in ordered
+            )
+            lines += [f"### `{m.name}` ({'Mapplet' if m.is_mapplet else 'Mapping'}) -- `{m.folder}`\n",
+                      f"**DAG:** {dag}\n",
+                      f"**Source->Target pairs ({len(m.source_target_pairs)}):**\n"]
+            for pair in m.source_target_pairs:
+                scd_note = " *[SCD2]*" if pair.is_scd2 else ""
+                lines.append(f"  - `{pair.source_table}` -> `{pair.target_table}`"
+                             f"  strategy:`{pair.update_strategy}`{scd_note}")
+                if pair.scd_key_cols:
+                    lines.append(f"    Keys: {', '.join(pair.scd_key_cols)}")
+                if pair.scd_hist_cols:
+                    lines.append(f"    History cols: {', '.join(pair.scd_hist_cols)}")
+            lines.append("\n**Expressions:**\n")
+            for tname, t in m.transformations.items():
+                for f in t.fields:
+                    if f.expression:
+                        raw = f.expression.replace("\r\n"," ").replace("\n"," ")[:100]
+                        dbt = self.xp.transpile(f.expression)[:100]
+                        if raw != dbt:
+                            lines += [f"  - `{tname}.{f.name}`",
+                                      f"    - Infa   : `{raw}`",
+                                      f"    - DuckDB : `{dbt}`"]
+            lines.append("")
+        lines.append("## Workflows\n")
+        for wf in workflows:
+            lines += [f"### `{wf.name}` -- `{wf.folder}`\n","**Sessions:**\n"]
+            for i, s in enumerate(wf.sessions, 1):
+                lines.append(f"  {i}. `{s.name}` -> mapping:`{s.mapping_name}`")
+            lines.append("")
+        lines.append("## Taskflows\n")
+        for tf in taskflows:
+            lines += [f"### `{tf.name}`\n","**Steps:**\n"]
+            for i, s in enumerate(tf.steps, 1):
+                lines.append(f"  {i}. `{s.task_name}` ({s.task_type}) GUID:`{s.guid}`")
+            lines.append("")
+        _write(self.out / "lineage_report.md", "\n".join(lines))
+
+
+# ===========================================================================
+# IDMC client (condensed — unchanged from previous version)
+# ===========================================================================
+@dataclass
+class IDMCConfig:
+    pod_url: str; token: str
+    page_size: int = 50; max_retries: int = 3; retry_delay: float = 2.0
+    @classmethod
+    def from_args(cls, args) -> "IDMCConfig":
+        pod_url = getattr(args,"pod_url",None) or os.environ.get("IDMC_POD_URL","")
+        token   = getattr(args,"token",None)   or os.environ.get("IDMC_TOKEN","")
+        if not pod_url or not token:
+            raise ValueError("Provide --pod-url and --token, or set IDMC_POD_URL/IDMC_TOKEN.")
+        return cls(pod_url=pod_url.rstrip("/"), token=token)
+
+class IDMCClient:
+    _D="/api/v3"; _P="/api/v2"
+    def __init__(self, cfg: IDMCConfig):
+        self.cfg=cfg
+        self._h={"Authorization":f"Bearer {cfg.token}","Content-Type":"application/json","Accept":"application/json"}
+    def _get(self, url, params=None):
+        full = url if url.startswith("http") else f"{self.cfg.pod_url}{url}"
+        if params: full += "?" + "&".join(f"{k}={v}" for k,v in params.items())
+        for attempt in range(1, self.cfg.max_retries+1):
+            try:
+                if _HTTP=="httpx":
+                    r=httpx.get(full,headers=self._h,timeout=60); r.raise_for_status(); return r.json()
+                else:
+                    req=urllib.request.Request(full,headers=self._h)
+                    with urllib.request.urlopen(req,timeout=60) as r: return json.loads(r.read().decode())
+            except Exception as exc:
+                if attempt==self.cfg.max_retries: raise RuntimeError(f"GET {full}: {exc}") from exc
+                time.sleep(self.cfg.retry_delay*attempt)
+    def _get_bin(self, url):
+        full=url if url.startswith("http") else f"{self.cfg.pod_url}{url}"
+        h=dict(self._h); h["Accept"]="application/xml,*/*"
+        for attempt in range(1, self.cfg.max_retries+1):
+            try:
+                if _HTTP=="httpx":
+                    r=httpx.get(full,headers=h,timeout=120); r.raise_for_status(); return r.content
+                else:
+                    req=urllib.request.Request(full,headers=h)
+                    with urllib.request.urlopen(req,timeout=120) as r: return r.read()
+            except Exception as exc:
+                if attempt==self.cfg.max_retries: raise RuntimeError(f"BinGET {full}: {exc}") from exc
+                time.sleep(self.cfg.retry_delay*attempt)
+    def _pag(self, url, extra=None):
+        res,off=[],0
+        while True:
+            p={"limit":self.cfg.page_size,"skip":off}
+            if extra: p.update(extra)
+            page=self._get(url,p)
+            items=page if isinstance(page,list) else page.get("items",page.get("data",[]))
+            if not items: break
+            res.extend(items)
+            if len(items)<self.cfg.page_size: break
+            off+=self.cfg.page_size
+        return res
+    def list_mappings(self,pid=None):
+        p={"type":"MTT"}
+        if pid: p["projectId"]=pid
+        r=self._pag(f"{self._D}/mttasks",p); print(f"    IDMC: {len(r)} mapping(s)"); return r
+    def list_mapplets(self,pid=None):
+        p={"projectId":pid} if pid else {}
+        r=self._pag(f"{self._D}/mapplets",p); print(f"    IDMC: {len(r)} mapplet(s)"); return r
+    def export_xml(self,oid,otype):
+        payload=json.dumps({"objects":[{"id":oid,"type":otype}],"options":{"exportFormat":"POWERMART"}}).encode()
+        url=f"{self.cfg.pod_url}{self._D}/export"; h=dict(self._h); h["Accept"]="application/xml"
+        if _HTTP=="httpx":
+            r=httpx.post(url,content=payload,headers=h,timeout=120); r.raise_for_status()
+            if r.status_code==202: return self._poll(r.headers.get("Location",""))
+            return r.content
+        else:
+            req=urllib.request.Request(url,data=payload,headers=h,method="POST")
+            with urllib.request.urlopen(req,timeout=120) as r: return r.read()
+    def _poll(self,job_url,max_wait=300):
+        for _ in range(max_wait//5):
+            time.sleep(5); d=self._get(job_url)
+            if d.get("status")=="SUCCESSFUL": return self._get_bin(d.get("downloadUrl",""))
+            if d.get("status") in ("FAILED","ERROR"): raise RuntimeError(f"Export failed: {d}")
+        raise TimeoutError("Export timed out")
+    def list_taskflows(self,pid=None):
+        p={"projectId":pid} if pid else {}
+        r=self._pag(f"{self._D}/taskflows",p); print(f"    IDMC: {len(r)} taskflow(s)"); return r
+    def export_tf_xml(self,tid): return self._get_bin(f"{self._D}/taskflows/{tid}/export")
+    def get_tf(self,tid): return self._get(f"{self._D}/taskflows/{tid}")
+    def list_connections(self):
+        r=self._pag(f"{self._P}/connections"); print(f"    IDMC: {len(r)} connection(s)"); return r
+    def get_conn(self,cid): return self._get(f"{self._P}/connections/{cid}")
+
+class IDMCFetcher:
+    def __init__(self, client: IDMCClient, out_dir: Path):
+        self.client=client; self.out=out_dir
+        self.raw=out_dir/"_idmc_raw"; self.raw.mkdir(parents=True,exist_ok=True)
+    def fetch_all(self, pid=None):
+        print("\n[IDMC] Connections..."); conns=self._fetch_conns()
+        print("\n[IDMC] Mappings..."); mappings=self._fetch_mappings(pid)
+        print("\n[IDMC] Taskflows..."); taskflows=self._fetch_tf(pid)
+        return mappings, taskflows, conns
+    def _fetch_conns(self):
+        raw=self.client.list_connections(); cat=[]
+        for c in raw:
+            cid=c.get("id",""); cn=c.get("name",cid)
+            try: d=self.client.get_conn(cid)
+            except: d=c
+            cat.append({"id":cid,"name":cn,"type":d.get("type",""),"host":d.get("host",""),
+                         "port":str(d.get("port","")),"database":d.get("database",""),
+                         "username":d.get("username","")})
+            _write(self.raw/"connections"/f"{_snake(cn)}.json", json.dumps(d,indent=2))
+        _write(self.out/"connections_catalog.json", json.dumps(cat,indent=2))
+        return cat
+    def _fetch_mappings(self, pid):
+        pm=PowerMartParser(); all_m=[]
+        for item in self.client.list_mappings(pid):
+            oid,on=item.get("id",""),item.get("name","")
+            print(f"    -> {on}")
+            try:
+                xb=self.client.export_xml(oid,"MTT")
+                xp=self.raw/"mappings"/f"{_snake(on)}.xml"; xp.parent.mkdir(parents=True,exist_ok=True)
+                xp.write_bytes(xb); ms,_=pm.parse_file(str(xp)); all_m.extend(ms)
+            except Exception as e: print(f"       Warning: {e}")
+        for item in self.client.list_mapplets(pid):
+            oid,on=item.get("id",""),item.get("name","")
+            try:
+                xb=self.client.export_xml(oid,"MAPPLET")
+                xp=self.raw/"mapplets"/f"{_snake(on)}.xml"; xp.parent.mkdir(parents=True,exist_ok=True)
+                xp.write_bytes(xb); ms,_=pm.parse_file(str(xp)); all_m.extend(ms)
+            except Exception as e: print(f"       Warning: {e}")
+        return all_m
+    def _fetch_tf(self, pid):
+        tfp=InformaticaTaskflowParser(); tfs=[]
+        for item in self.client.list_taskflows(pid):
+            tid,tn=item.get("id",""),item.get("name","")
+            try:
+                xb=self.client.export_tf_xml(tid)
+                xp=self.raw/"taskflows"/f"{_snake(tn)}.xml"; xp.parent.mkdir(parents=True,exist_ok=True)
+                xp.write_bytes(xb); tf=tfp.parse_file(str(xp)); tfs.append(tf)
+                print(f"    -> '{tf.name}' ({len(tf.steps)} steps)")
+            except Exception as e: print(f"       Warning: {e}")
+        return tfs
+
+
+# ===========================================================================
+# PowerCenter Fetcher (SOAP / DB / XML)
+# ===========================================================================
+class PCSOAPClient:
+    def __init__(self, host, port, repo, user, password, use_https=False):
+        self.base=f"{'https' if use_https else 'http'}://{host}:{port}"
+        self.repo=repo; self.user=user; self.password=password; self._token=""
+    def connect(self):
+        try:
+            import requests; self._sess=requests.Session()
+        except ImportError:
+            raise RuntimeError("pip install requests lxml")
+        body=(f"<mws:Login><mws:RepositoryName>{self.repo}</mws:RepositoryName>"
+              f"<mws:UserName>{self.user}</mws:UserName>"
+              f"<mws:Password>{self.password}</mws:Password></mws:Login>")
+        resp=self._post("Login",body)
+        tok=resp.find(".//{*}SessionToken")
+        self._token=tok.text if tok is not None else ""
+        print(f"  [PC SOAP] Connected {self.base}")
+    def _post(self, action, body):
+        env=(f'<?xml version="1.0"?><soapenv:Envelope '
+             f'xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
+             f'xmlns:mws="http://www.informatica.com/wsh">'
+             f"<soapenv:Header/><soapenv:Body>{body}</soapenv:Body></soapenv:Envelope>")
+        url=f"{self.base}/wsh/services/RepositoryService"
+        hdrs={"Content-Type":"text/xml; charset=utf-8","SOAPAction":f'"{action}"'}
+        if self._token: hdrs["Authorization"]=f"Basic {self._token}"
+        r=self._sess.post(url,data=env.encode(),headers=hdrs,timeout=120); r.raise_for_status()
+        root=ET.fromstring(r.content)
+        body_el=root.find(".//{http://schemas.xmlsoap.org/soap/envelope/}Body")
+        return body_el[0] if body_el is not None and len(body_el) else root
+    def list_folders(self):
+        body=f"<mws:GetAllFolders><mws:SessionToken>{self._token}</mws:SessionToken></mws:GetAllFolders>"
+        resp=self._post("GetAllFolders",body)
+        return [el.text for el in resp.findall(".//{*}FolderName") if el.text]
+    def export_folder_xml(self, folder):
+        body=(f"<mws:ExportObjects><mws:SessionToken>{self._token}</mws:SessionToken>"
+              f"<mws:ObjectsToExport><mws:FolderName>{folder}</mws:FolderName>"
+              f"<mws:ObjectTypes>mapping</mws:ObjectTypes>"
+              f"<mws:ObjectTypes>mapplet</mws:ObjectTypes>"
+              f"<mws:ObjectTypes>workflow</mws:ObjectTypes>"
+              f"</mws:ObjectsToExport>"
+              f"<mws:DependencyOptions><mws:AddDependency>false</mws:AddDependency>"
+              f"</mws:DependencyOptions></mws:ExportObjects>")
+        resp=self._post("ExportObjects",body)
+        el=resp.find(".//{*}ExportedObjects")
+        return el.text.encode() if el is not None and el.text else ET.tostring(resp)
+    def disconnect(self):
+        try:
+            self._post("Logout",f"<mws:Logout><mws:SessionToken>{self._token}</mws:SessionToken></mws:Logout>")
+        except: pass
+
+
+class PCFetcher:
+    def __init__(self, args, out_dir: Path):
+        self.args=args; self.out=out_dir
+        self.raw=out_dir/"_pc_raw"; self.raw.mkdir(parents=True,exist_ok=True)
+        self.pm=PowerMartParser(); self.par=ParameterFileParser()
+    def fetch_all(self):
+        mode=getattr(self.args,"pc_mode","xml")
+        if mode=="soap": return self._soap()
+        if mode=="db":   return self._db()
+        return self._xml()
+    def _soap(self):
+        client=PCSOAPClient(self.args.pc_host,int(self.args.pc_port or 7333),
+                             self.args.pc_repo,self.args.pc_user,self.args.pc_password,
+                             getattr(self.args,"pc_https",False))
+        client.connect()
+        all_m,all_w=[],[]
+        try:
+            for folder in client.list_folders():
+                try:
+                    xb=client.export_folder_xml(folder)
+                    xp=self.raw/f"{_snake(folder)}.xml"; xp.write_bytes(xb)
+                    ms,wfs=self.pm.parse_file(str(xp)); all_m.extend(ms); all_w.extend(wfs)
+                except Exception as e: print(f"    Warning {folder}: {e}")
+        finally: client.disconnect()
+        return all_m, all_w, self._infer_conns(all_w), self._params()
+    def _db(self):
+        try: from sqlalchemy import create_engine, text
+        except ImportError: raise RuntimeError("pip install sqlalchemy cx_Oracle")
+        engine=create_engine(self.args.pc_db_url)
+        def q(sql, p=None):
+            with engine.connect() as conn:
+                r=conn.execute(text(sql), p or {})
+                cols=list(r.keys())
+                return [dict(zip(cols,row)) for row in r]
+        # Read mappings via OPB tables
+        mapping_rows=q("""SELECT m.MAPPING_ID,m.MAPPING_NAME,m.COMMENTS,
+            s.SUBJ_NAME AS FOLDER_NAME,
+            CASE WHEN m.IS_MAPPLET=1 THEN 'MAPPLET' ELSE 'MAPPING' END AS OBJ_TYPE
+            FROM OPB_MAPPING m JOIN OPB_SUBJECT s ON s.SUBJ_ID=m.SUBJECT_ID""")
+        all_m=[]
+        for row in mapping_rows:
+            mid=row["MAPPING_ID"]
+            m=Mapping(name=row["MAPPING_NAME"],folder=row["FOLDER_NAME"],
+                      description=row.get("COMMENTS",""),
+                      is_mapplet=(row["OBJ_TYPE"]=="MAPPLET"))
+            wids={}
+            for wr in q("SELECT WIDGET_ID,WIDGET_NAME,WIDGET_TYPE_NAME,REUSABLE,DESCRIPTION FROM OPB_WIDGET WHERE MAPPING_ID=:mid",{"mid":mid}):
+                wid=wr["WIDGET_ID"]; wn=wr["WIDGET_NAME"]; wids[wid]=wn
+                t=Transformation(name=wn,ttype=wr.get("WIDGET_TYPE_NAME",""),
+                                  description=wr.get("DESCRIPTION",""),reusable=bool(wr.get("REUSABLE",0)))
+                m.transformations[wn]=t; m.instances[wn]=MappingInstance(wn,wn,t.ttype)
+            for fr in q("""SELECT WIDGET_ID,FIELD_NAME,DATATYPE,PORTTYPE,DEFAULT_VALUE,
+                DESCRIPTION,PRECISION,SCALE,EXPRESSION FROM OPB_WIDGET_FIELD
+                WHERE WIDGET_ID IN (SELECT WIDGET_ID FROM OPB_WIDGET WHERE MAPPING_ID=:mid)""",{"mid":mid}):
+                wn=wids.get(fr["WIDGET_ID"])
+                if wn and wn in m.transformations:
+                    m.transformations[wn].fields.append(TransformField(
+                        name=fr["FIELD_NAME"],datatype=fr.get("DATATYPE","string"),
+                        port_type=fr.get("PORTTYPE","INPUT"),expression=fr.get("EXPRESSION","") or "",
+                        precision=int(fr.get("PRECISION",4000) or 4000),scale=int(fr.get("SCALE",0) or 0),
+                        default_value=fr.get("DEFAULT_VALUE","") or "",description=fr.get("DESCRIPTION","") or ""))
+            for ar in q("""SELECT WIDGET_ID,ATTR_NAME,ATTR_VALUE FROM OPB_WIDGET_ATTR
+                WHERE WIDGET_ID IN (SELECT WIDGET_ID FROM OPB_WIDGET WHERE MAPPING_ID=:mid)""",{"mid":mid}):
+                wn=wids.get(ar["WIDGET_ID"])
+                if wn and wn in m.transformations:
+                    m.transformations[wn].attributes[ar["ATTR_NAME"]]=ar["ATTR_VALUE"] or ""
+            for lr in q("""SELECT FROM_WIDGET_ID,FROM_FIELD_NAME,TO_WIDGET_ID,TO_FIELD_NAME
+                FROM OPB_LINK WHERE MAPPING_ID=:mid""",{"mid":mid}):
+                m.connectors.append(Connector(
+                    from_instance=wids.get(lr["FROM_WIDGET_ID"],str(lr["FROM_WIDGET_ID"])),
+                    from_field=lr["FROM_FIELD_NAME"],
+                    to_instance=wids.get(lr["TO_WIDGET_ID"],str(lr["TO_WIDGET_ID"])),
+                    to_field=lr["TO_FIELD_NAME"]))
+            m.detect_source_target_pairs()
+            if m.transformations: all_m.append(m)
+        conns=[{"id":str(r.get("OBJECT_ID","")),"name":r.get("OBJECT_NAME",""),
+                 "type":r.get("OBJECT_TYPE_NAME",""),"host":r.get("SERVER_NAME",""),
+                 "port":str(r.get("PORT_NO","")),"database":r.get("DATABASE_NAME","")}
+               for r in q("SELECT OBJECT_ID,OBJECT_NAME,OBJECT_TYPE_NAME,SERVER_NAME,PORT_NO,DATABASE_NAME FROM OPB_CNX")]
+        return all_m, [], conns, self._params()
+    def _xml(self):
+        xml_path=getattr(self.args,"xml",None) or "."
+        files=collect_files(xml_path,(".xml",))
+        all_m,all_w=[],[]
+        for f in files:
+            try:
+                ms,wfs=self.pm.parse_file(f); all_m.extend(ms); all_w.extend(wfs)
+            except Exception as e: print(f"    Warning {f}: {e}")
+        return all_m, all_w, self._infer_conns(all_w), self._params()
+    def _params(self):
+        pp=getattr(self.args,"pc_params",None)
+        if not pp: return {}
+        try:
+            cat=self.par.parse_dir(pp) if Path(pp).is_dir() else self.par.parse_file(pp)
+            _write(self.out/"param_catalog.json", json.dumps(cat,indent=2))
+            return cat
+        except Exception as e:
+            print(f"  Warning param load: {e}"); return {}
+    @staticmethod
+    def _infer_conns(workflows):
+        seen=set(); conns=[]
+        for wf in workflows:
+            for s in wf.sessions:
+                for n in list(s.source_connections.values())+list(s.target_connections.values()):
+                    if n and n not in seen:
+                        seen.add(n); conns.append({"id":n,"name":n,"type":"inferred","host":"","database":""})
+        return conns
+
+
+# ===========================================================================
+# CLI
+# ===========================================================================
+def main():
+    ap = argparse.ArgumentParser(
+        description="Informatica (IDMC/PowerCenter) -> dbt/DuckDB",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              python informatica_to_dbt.py --xml ./exports/ --json project.json
+              python informatica_to_dbt.py --idmc --token <tok> --pod-url https://usw1.dm-us.informaticacloud.com
+              python informatica_to_dbt.py --pc --pc-mode soap --pc-host myhost --pc-repo DEV --pc-user admin --pc-password secret
+              python informatica_to_dbt.py --pc --pc-mode db --pc-db-url "oracle+cx_oracle://u:p@h:1521/SID"
+              python informatica_to_dbt.py --pc --pc-mode xml --xml ./pc_exports/ --pc-params ./params/DEV.par
+        """),
+    )
+    mg = ap.add_mutually_exclusive_group(required=True)
+    mg.add_argument("--xml",  metavar="PATH")
+    mg.add_argument("--idmc", action="store_true")
+    mg.add_argument("--pc",   action="store_true")
+
+    ap.add_argument("--pod-url");    ap.add_argument("--token")
+    ap.add_argument("--project-id"); ap.add_argument("--fetch-only", action="store_true")
+    ap.add_argument("--pc-mode",     default="xml", choices=["soap","db","xml"])
+    ap.add_argument("--pc-host");    ap.add_argument("--pc-port", default="7333")
+    ap.add_argument("--pc-repo");    ap.add_argument("--pc-user")
+    ap.add_argument("--pc-password", default=os.environ.get("PC_PASSWORD",""))
+    ap.add_argument("--pc-https",    action="store_true")
+    ap.add_argument("--pc-db-url");  ap.add_argument("--pc-params", metavar="PATH")
+    ap.add_argument("--json",        metavar="PATH")
+    ap.add_argument("--out",         default="./dbt_output")
+    args = ap.parse_args()
+    out  = Path(args.out)
+
+    taskflows:    list[Taskflow] = []
+    mappings:     list[Mapping]  = []
+    workflows:    list[Workflow] = []
+    connections:  list[dict]     = []
+    params:       dict           = {}
+    project_meta: Optional[dict] = None
+
+    if args.idmc:
+        print("[IDMC] Connecting...")
+        try:
+            cfg=IDMCConfig.from_args(args); client=IDMCClient(cfg)
+            fetcher=IDMCFetcher(client,out)
+            mappings,taskflows,connections=fetcher.fetch_all(pid=args.project_id)
+        except ValueError as e:
+            print(f"Error: {e}"); sys.exit(1)
+        if args.fetch_only:
+            print(f"Raw files -> {(out/'_idmc_raw').resolve()}"); return
+
+    elif args.pc:
+        print(f"[PowerCenter] mode={args.pc_mode}")
+        mappings,workflows,connections,params=PCFetcher(args,out).fetch_all()
+
+    else:
+        xml_files=collect_files(args.xml,(".xml",))
+        print(f"Found {len(xml_files)} XML file(s).\n")
+        tfp=InformaticaTaskflowParser(); pmp=PowerMartParser()
+        for xf in xml_files:
+            print(f"  Parsing: {xf}")
+            try:
+                tf=tfp.parse_file(xf)
+                print(f"    -> Taskflow '{tf.name}' ({len(tf.steps)} step(s))")
+                taskflows.append(tf); continue
+            except Exception: pass
+            try:
+                ms,wfs=pmp.parse_file(xf)
+                for m in ms:
+                    print(f"    -> {'Mapplet' if m.is_mapplet else 'Mapping'} '{m.name}' "
+                          f"({len(m.transformations)} transforms, "
+                          f"{len(m.connectors)} connectors, "
+                          f"{len(m.source_target_pairs)} S->T pair(s))")
+                for w in wfs:
+                    print(f"    -> Workflow '{w.name}' ({len(w.sessions)} session(s))")
+                mappings.extend(ms); workflows.extend(wfs)
+            except Exception as e:
+                print(f"    Warning: Skipped ({e})")
+        if args.json:
+            try:
+                project_meta=ProjectJsonParser().parse_file(args.json)
+                print(f"\n  Project: '{project_meta['name']}'")
+            except Exception as e:
+                print(f"  Warning: project JSON skipped ({e})")
+
+    if not taskflows and not mappings and not workflows:
+        print("\nNothing parsed. Exiting."); sys.exit(1)
+
+    # Build flat params for expression transpiler
+    flat_params: dict[str, str] = {}
+    par_parser = ParameterFileParser()
+    for sec_vals in params.values():
+        flat_params.update(sec_vals)
+
+    gen = DbtGenerator(out_dir=str(out), flat_params=flat_params)
+    gen.generate(taskflows, mappings, workflows, project_meta, connections, params)
+
+
+if __name__ == "__main__":
+    main()
